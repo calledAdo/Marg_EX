@@ -2,7 +2,7 @@
 
 pragma solidity ^0.8.9;
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
-import {IPool, ERC20} from "./Pool.sol";
+import {Vault, IERC20} from "./Pool.sol";
 
 library SigVerify {
     function getMessageHash(
@@ -66,12 +66,12 @@ library SigVerify {
 contract Dex {
     using SigVerify for bytes;
     address admin;
-    ERC20 collateralToken;
+    IERC20 collateralToken;
 
-    mapping(address => uint) getUserBalance;
-    mapping(uint => Vault) getVaultByID;
-    mapping(uint => vaultLiquidityShares) getVaultSharesByID;
-    mapping(bytes32 => Order) getOrderByKey;
+    mapping(address => uint) m_getUserBalance;
+    mapping(uint => VaultDetails) m_getVaultByID;
+
+    mapping(bytes32 => Order) m_getOrderByKey;
 
     event openedPosition(bytes32 key, bool islong, uint debt);
     event closedPosition(bytes32 key, bool islong, uint debt);
@@ -80,7 +80,7 @@ contract Dex {
         address owner;
         uint vaultID;
         bool isLong;
-        uint collateral;
+        uint collateralAmount;
         uint debt;
         uint orderSize;
         uint timestamp;
@@ -91,277 +91,143 @@ contract Dex {
     /// vault address => the address of the vault contract
     /// token => the token of the vault
     /// oracleAddress => the price oracle address
-    /// minCollateral => min collateral needed for a margined Position
-    /// liquidityBalance => amount of collateral tokens available for that vault
+    /// minCollateral => min collateralAmount needed for a margined Position
+    /// liquidityBalance => amount of collateralAmount tokens available for that vault
     // marginFees => margin fee in percentage paid every 1 hour
-    struct Vault {
-        address poolAddress;
-        ERC20 token;
-        address oracleAddress;
-        uint minCollateral;
+    struct VaultDetails {
+        address vaultAddress;
+        address vaultBaseToken;
         uint minMaintainanceMargin;
-        uint liquiditylBalance;
-        uint totalDebt;
         uint marginFees;
     }
 
-    ///@dev vaultLiquidityShares data type representing the available collateral liquidity for any pool
+    ///@dev vaultLiquidityShares data type representing the available collateralAmount liquidity for any pool
     //it comprises of
-    //liquidityBalance =>  amount of collateral tokens available for that vault
+    //liquidityBalance =>  amount of collateralAmount tokens available for that vault
     //userPoolShares => a mapping of userBalances of poolShares
     // totalSHares => totalShares of the vault liquidity
-    struct vaultLiquidityShares {
-        uint liquiditylBalance;
-        mapping(address => uint) userPoolShares;
-        uint totallShares;
-        uint totalDebt;
-    }
 
-    ///@dev OrderProvider data type representing liquidity provider for a trade
-    //it comprises of
-    //owner => the address of the liquidity provider and the address to recieve funds
-    // signature => the signature to validate the provision of liquidity,providers should have approved this contract address to spend this much
-    //takerPremium => the discount in percentage given to the liquidity provider;
     struct OrderProvider {
-        address owner;
+        address signer;
         bytes signature;
-        uint takerPremium;
+        uint premium;
         uint maxTimestamp;
     }
 
-    /// @dev function for depositing collateral into into the dex;
-    //NOTE:This ia different from depositing into pools
-    //the deposited amount will be used to deposit to preferred pools;
-    function depositCollateral(uint amount) external {
-        collateralToken.transferFrom(msg.sender, address(this), amount);
-        getUserBalance[msg.sender] += amount;
-    }
-
-    function addCollateralAsLiquidity(uint vaultId, uint amount) external {
-        require(getUserBalance[msg.sender] >= amount);
-        vaultLiquidityShares storage vaultShares = getVaultSharesByID[vaultId];
-        uint sharesToMint = (vaultShares.totallShares * amount) /
-            vaultShares.liquiditylBalance;
-
-        vaultShares.userPoolShares[msg.sender] += sharesToMint;
-        vaultShares.liquiditylBalance += amount;
-        getUserBalance[msg.sender] -= amount;
-        vaultShares.totallShares += sharesToMint;
-        getVaultByID[vaultId].liquiditylBalance += amount;
-    }
-
-    function withdrawCollateralLiquidity(
-        uint vaultID,
-        uint amountOfShares
-    ) external {
-        vaultLiquidityShares storage vaultShares = getVaultSharesByID[vaultID];
-        require(vaultShares.userPoolShares[msg.sender] >= amountOfShares);
-        uint amountToSend = (amountOfShares *
-            (vaultShares.liquiditylBalance + vaultShares.totalDebt)) /
-            vaultShares.totallShares;
-        vaultShares.userPoolShares[msg.sender] -= amountOfShares;
-        vaultShares.liquiditylBalance -= amountToSend;
-        vaultShares.totallShares -= amountOfShares;
-        getUserBalance[msg.sender] += amountToSend;
-        getVaultByID[vaultID].liquiditylBalance -= amountToSend;
-    }
-
     function openPosition(
-        uint vaultID,
         bool isLong,
-        uint collateral,
+        uint vaultID,
+        uint collateralTokenID,
+        uint collateralAmount,
         uint debt,
-        OrderProvider memory LP
+        OrderProvider memory provider
     ) external {
-        require(
-            block.timestamp <= LP.maxTimestamp &&
-                LP.signature.verify(vaultID, isLong, LP.owner, LP.maxTimestamp)
-        );
-
-        bytes32 orderKey = keccak256(abi.encodePacked(msg.sender, vaultID));
-
-        require(getOrderByKey[orderKey].owner == address(0));
-
-        Vault memory vault = getVaultByID[vaultID];
-
-        require(collateral >= vault.minCollateral);
+        VaultDetails memory _vaultDetails = m_getVaultByID[vaultID];
+        Vault vault = Vault(_vaultDetails.vaultAddress);
+        (bool isCollateral, bool isStable, address tokenAddress) = vault
+            .getTokenDetails(collateralTokenID);
+        require(isCollateral);
 
         uint amountIn;
+        uint amountOut;
         if (isLong) {
-            amountIn = openLong(vault, collateral, debt, LP);
+            openLong(
+                vault,
+                collateralTokenID,
+                tokenAddress,
+                collateralAmount,
+                debt + collateralAmount,
+                isStable,
+                provider
+            );
         } else {
-            amountIn = openShort(vault, collateral, debt, LP);
+            openShort(
+                vault,
+                collateralTokenID,
+                tokenAddress,
+                collateralAmount,
+                debt + collateralAmount,
+                isStable,
+                provider
+            );
         }
-
-        getOrderByKey[orderKey] = Order(
-            msg.sender,
-            vaultID,
-            isLong,
-            collateral,
-            debt,
-            amountIn,
-            block.timestamp
-        );
-
-        emit openedPosition(orderKey, isLong, debt);
     }
 
     function openLong(
-        Vault memory vault,
-        uint collateral,
-        uint debt,
-        OrderProvider memory LP
-    ) private returns (uint) {
-        uint poolmaxDebt = (2 * vault.liquiditylBalance) / 3;
-
-        require(debt <= poolmaxDebt);
-
-        uint orderValue = convertUSDToToken(
-            vault.oracleAddress,
-            debt + collateral
+        Vault _vault,
+        uint collateralTokenID,
+        address collateralAddress,
+        uint collateralAmount,
+        uint orderValue,
+        bool isStable,
+        OrderProvider memory provider
+    ) internal {
+        address owner = msg.sender;
+        uint collateralValue = collateralAmount;
+        uint amountIn;
+        uint amountOut;
+        if (isStable) {
+            uint equivalent = _vault.longWithStable(orderValue);
+            amountIn = equivalent - percentage(equivalent, provider.premium);
+        } else {
+            (uint equivalent, uint _collateralValue) = _vault.longWithToken(
+                collateralTokenID,
+                orderValue,
+                collateralAmount
+            );
+            amountIn = equivalent - percentage(equivalent, provider.premium);
+            collateralValue = _collateralValue;
+        }
+        IERC20(collateralAddress).transferFrom(
+            owner,
+            address(_vault),
+            collateralAmount
         );
-
-        uint amountIn = orderValue - percentage(orderValue, LP.takerPremium);
-
-        collateralToken.transferFrom(msg.sender, address(this), collateral);
-
-        vault.token.transferFrom(LP.owner, address(this), amountIn);
-
-        collateralToken.transfer(LP.owner, debt + collateral);
-
-        vault.liquiditylBalance -= debt;
-
-        vault.totalDebt += debt;
-
-        return amountIn;
+        IERC20(_vault.poolToken()).transferFrom(
+            provider.signer,
+            address(this),
+            amountIn
+        );
+        _vault.transferToken(collateralTokenID, provider.signer, orderValue);
     }
 
     function openShort(
-        Vault memory vault,
-        uint collateral,
-        uint debt,
-        OrderProvider memory LP
-    ) private returns (uint) {
-        IPool pool = IPool(vault.poolAddress);
-
-        require(debt <= pool.getMaxDebt());
-
-        uint orderValue = convertTokenToUSD(vault.oracleAddress, debt);
-
-        uint amountIn = orderValue - percentage(orderValue, LP.takerPremium);
-
-        collateralToken.transferFrom(msg.sender, address(this), collateral);
-
-        collateralToken.transferFrom(LP.owner, address(this), amountIn);
-
-        pool._transfer(LP.owner, debt);
-
-        pool.increaseDebt(debt);
-
-        return amountIn;
-    }
-
-    /// @dev used for closing long positions
-
-    function closePosition(bytes32 orderKey, OrderProvider memory LP) external {
-        Order memory order = getOrderByKey[orderKey];
-        require(msg.sender == order.owner);
-        Vault memory vault = getVaultByID[order.vaultID];
-        if (order.isLong) {
-            closeLong(vault, order, LP);
+        Vault _vault,
+        uint collateralTokenID,
+        address collateralAddress,
+        uint collateralAmount,
+        uint orderValue,
+        bool isStable,
+        OrderProvider memory provider
+    ) internal {
+        address owner = msg.sender;
+        uint collateralValue = collateralAmount;
+        uint amountIn;
+        uint amountOut;
+        if (isStable) {
+            uint equivalent = _vault.shortWithStable(orderValue);
+            amountIn = equivalent - percentage(equivalent, provider.premium);
         } else {
-            closeShort(vault, order, LP);
+            (uint equivalent, uint _collateralValue) = _vault.shortWithToken(
+                collateralTokenID,
+                orderValue,
+                collateralAmount
+            );
+            amountIn = equivalent - percentage(equivalent, provider.premium);
+            collateralValue = _collateralValue;
         }
 
-        delete getOrderByKey[orderKey];
-    }
-
-    function closeLong(
-        Vault memory vault,
-        Order memory order,
-        OrderProvider memory LP
-    ) internal {
-        uint orderValue = convertTokenToUSD(
-            vault.oracleAddress,
-            order.orderSize
+        IERC20(collateralAddress).transferFrom(
+            owner,
+            address(this),
+            collateralAmount
         );
-
-        uint amountIn = orderValue - percentage(orderValue, LP.takerPremium);
-
-        uint totalDebt = order.debt +
-            cummulativeMarginFees(
-                order.debt,
-                vault.marginFees,
-                order.timestamp,
-                1 hours
-            );
-
-        uint pnl = amountIn - totalDebt;
-
-        collateralToken.transferFrom(LP.owner, address(this), amountIn);
-
-        vault.token.transfer(LP.owner, order.orderSize);
-
-        collateralToken.transfer(order.owner, pnl);
-
-        vault.totalDebt -= totalDebt;
-        vault.liquiditylBalance += totalDebt;
-    }
-
-    function closeShort(
-        Vault memory vault,
-        Order memory order,
-        OrderProvider memory LP
-    ) internal {
-        IPool pool = IPool(vault.poolAddress);
-        uint totalDebt = order.debt +
-            cummulativeMarginFees(
-                order.debt,
-                vault.marginFees,
-                order.timestamp,
-                1 hours
-            );
-        uint debtValue = convertUSDToToken(vault.oracleAddress, totalDebt);
-
-        uint orderSize = debtValue + percentage(debtValue, LP.takerPremium);
-
-        uint pnl = order.collateral + order.orderSize - orderSize;
-
-        vault.token.transferFrom(LP.owner, vault.poolAddress, totalDebt);
-
-        collateralToken.transfer(LP.owner, orderSize);
-
-        collateralToken.transfer(order.owner, pnl);
-
-        pool.decreaseDebt(order.debt);
-    }
-
-    ///@dev function used to liquidate
-
-    function liquidatePosition(
-        bytes32 orderKey,
-        OrderProvider memory LP
-    ) external {
-        Order memory order = getOrderByKey[orderKey];
-
-        Vault memory vault = getVaultByID[order.vaultID];
-
-        if (order.isLong) {
-            uint positionValue = convertTokenToUSD(
-                vault.oracleAddress,
-                order.orderSize
-            );
-            uint maintainanceMargin = positionValue - order.debt;
-            require(maintainanceMargin < vault.minMaintainanceMargin);
-            closeLong(vault, order, LP);
-        } else {
-            uint debtValue = convertTokenToUSD(vault.oracleAddress, order.debt);
-            uint maintainanceMargin = order.collateral +
-                order.orderSize -
-                debtValue;
-            require(maintainanceMargin < vault.minMaintainanceMargin);
-            closeShort(vault, order, LP);
-        }
+        IERC20(collateralAddress).transferFrom(
+            provider.signer,
+            address(this),
+            amountIn
+        );
+        _vault.transferPoolToken(provider.signer, orderValue);
     }
 
     function cummulativeMarginFees(
@@ -376,26 +242,6 @@ contract Dex {
             fee += percentage(amount, marginFee);
         }
         return fee;
-    }
-
-    function convertTokenToUSD(
-        address oracleAddress,
-        uint amount
-    ) public view returns (uint equivalent) {
-        AggregatorV3Interface oracle = AggregatorV3Interface(oracleAddress);
-        uint8 decimals = oracle.decimals();
-        (, int256 price, , , ) = oracle.latestRoundData();
-        equivalent = (uint256(price) * amount) / decimals;
-    }
-
-    function convertUSDToToken(
-        address oracleAddress,
-        uint amount
-    ) public view returns (uint equivalent) {
-        AggregatorV3Interface oracle = AggregatorV3Interface(oracleAddress);
-        uint8 decimals = oracle.decimals();
-        (, int256 price, , , ) = oracle.latestRoundData();
-        equivalent = (amount * decimals) / uint256(price);
     }
 
     function percentage(uint amount, uint percent) private pure returns (uint) {
